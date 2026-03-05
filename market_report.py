@@ -9,31 +9,29 @@ from email.mime.multipart import MIMEMultipart
 import pandas as pd
 import yfinance as yf
 
-
 TZ = ZoneInfo("Europe/Madrid")
 
-
 # ==============================
-# UNIVERSO
+# UNIVERSO (ETFs PROXY robustos)
 # ==============================
-
 INDICES = {
-    "S&P 500": "SPY",
-    "Nasdaq": "QQQ",
-    "Dow": "DIA",
-    "Russell 2000": "IWM",
+    "S&P 500 (SPY)": "SPY",
+    "Nasdaq (QQQ)": "QQQ",
+    "Dow (DIA)": "DIA",
+    "Russell 2000 (IWM)": "IWM",
 }
 
 SECTORS = {
-    "Technology": "XLK",
-    "Financials": "XLF",
-    "Energy": "XLE",
-    "Health Care": "XLV",
-    "Industrials": "XLI",
-    "Consumer Discretionary": "XLY",
-    "Consumer Staples": "XLP",
-    "Utilities": "XLU",
-    "Materials": "XLB",
+    "Technology (XLK)": "XLK",
+    "Financials (XLF)": "XLF",
+    "Energy (XLE)": "XLE",
+    "Health Care (XLV)": "XLV",
+    "Industrials (XLI)": "XLI",
+    "Cons Disc (XLY)": "XLY",
+    "Cons Staples (XLP)": "XLP",
+    "Utilities (XLU)": "XLU",
+    "Materials (XLB)": "XLB",
+    "Comm (XLC)": "XLC",
 }
 
 FACTORS = {
@@ -46,60 +44,69 @@ FACTORS = {
     "SPLV": "SPLV",
 }
 
-VIX_TICKER = "VIXY"
-
+VIX_TICKER = "VIXY"  # proxy VIX (más fiable que ^VIX en CI)
 
 # ==============================
 # UTILS
 # ==============================
+def _scalar(x):
+    """Convierte Series/numpy scalars a float python."""
+    try:
+        if hasattr(x, "iloc"):
+            x = x.iloc[-1]
+    except Exception:
+        pass
+    try:
+        return None if x is None else float(x)
+    except Exception:
+        return None
+
 
 def pct(a, b):
-    if a is None or b in (None, 0):
+    a = _scalar(a)
+    b = _scalar(b)
+    if a is None or b is None or b == 0:
         return None
-    return (a / b - 1) * 100
+    return (a / b - 1.0) * 100.0
 
 
-def fmt(x):
+def fmt_pct(x, nd=1):
     if x is None:
         return "n/a"
-    return f"{x:+.1f}%"
+    return f"{x:+.{nd}f}%"
 
 
 def semaforo(score):
-
     if score is None:
         return "⚪"
-
     if score >= 70:
         return "🟢"
-
     if score >= 40:
         return "🟡"
-
     return "🔴"
 
 
 # ==============================
-# DESCARGA DATOS
+# DESCARGA DATOS (robusta)
 # ==============================
-
-def download_series(ticker):
-
+def download_series(ticker: str) -> pd.DataFrame | None:
+    """
+    Descarga con yfinance. En GitHub Actions a veces Yahoo rate-limit;
+    este método es simple pero estable con ETFs.
+    """
     try:
-
         df = yf.download(
             ticker,
             period="650d",
             interval="1d",
             auto_adjust=True,
             progress=False,
+            threads=False,
+            group_by="column",
         )
-
-        if df.empty:
+        if df is None or df.empty or "Close" not in df.columns:
             return None
-
         return df
-
     except Exception:
         return None
 
@@ -107,207 +114,220 @@ def download_series(ticker):
 # ==============================
 # ANALISIS
 # ==============================
-
-def analyze(ticker):
-
+def analyze(ticker: str) -> dict | None:
     df = download_series(ticker)
-
-    if df is None:
+    if df is None or df.empty:
         return None
 
-    close = df["Close"].iloc[-1]
+    closes = df["Close"].dropna()
+    if closes.empty or len(closes) < 2:
+        return None
 
-    ma50 = df["Close"].rolling(50).mean().iloc[-1]
-    ma200 = df["Close"].rolling(200).mean().iloc[-1]
+    close = _scalar(closes.iloc[-1])
+    prev = _scalar(closes.iloc[-2])
 
-    prev = df["Close"].iloc[-2]
+    ma50 = _scalar(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
+    ma200 = _scalar(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else None
 
     ret1d = pct(close, prev)
-    ret1w = pct(close, df["Close"].iloc[-6])
-    ret1m = pct(close, df["Close"].iloc[-21])
+
+    ret1w = None
+    if len(closes) >= 6:
+        ret1w = pct(close, _scalar(closes.iloc[-6]))
+
+    ret1m = None
+    if len(closes) >= 22:
+        ret1m = pct(close, _scalar(closes.iloc[-22]))
+
+    dist200 = pct(close, ma200)
+    dist50 = pct(close, ma50)
+
+    above200 = (ma200 is not None and close > ma200)
 
     return {
         "close": close,
         "ret1d": ret1d,
         "ret1w": ret1w,
         "ret1m": ret1m,
-        "dist200": pct(close, ma200),
-        "dist50": pct(close, ma50),
-        "above200": close > ma200,
+        "dist200": dist200,
+        "dist50": dist50,
+        "above200": above200 if ma200 is not None else None,
     }
 
 
 # ==============================
 # BREADTH
 # ==============================
+def breadth(indices_stats: dict, sector_stats: dict):
+    idx = [v for v in indices_stats.values() if v and v.get("above200") is not None]
+    sec = [v for v in sector_stats.values() if v and v.get("above200") is not None]
 
-def breadth(indices, sectors):
-
-    idx = [v for v in indices.values() if v]
-
-    sec = [v for v in sectors.values() if v]
-
-    pct_idx = sum(1 for x in idx if x["above200"]) / max(len(idx),1) * 100
-    pct_sec = sum(1 for x in sec if x["above200"]) / max(len(sec),1) * 100
+    pct_idx = 100.0 * sum(1 for x in idx if x["above200"]) / max(1, len(idx))
+    pct_sec = 100.0 * sum(1 for x in sec if x["above200"]) / max(1, len(sec))
 
     return pct_idx, pct_sec
 
 
 # ==============================
-# SCORE
+# MARKET SCORE (0–100) + overrides simples
 # ==============================
+def market_score(indices_stats: dict, sector_stats: dict, vix_level: float | None):
+    pct_idx, pct_sec = breadth(indices_stats, sector_stats)
 
-def market_score(indices, sectors, vix):
+    # base
+    score = 0.50 * pct_idx + 0.50 * pct_sec
 
-    pct_idx, pct_sec = breadth(indices, sectors)
+    # overrides (B): penalizar estrés de volatilidad
+    if vix_level is not None:
+        if vix_level >= 30:
+            score -= 25
+        elif vix_level >= 25:
+            score -= 12
 
-    score = pct_idx * 0.4 + pct_sec * 0.4
+    # clamp
+    score = max(0.0, min(100.0, score))
 
-    if vix:
-
-        if vix > 30:
-            score -= 20
-
-        elif vix > 25:
-            score -= 10
-
-    score = max(0, min(100, score))
-
-    label = "Risk-on" if score >= 70 else "Neutral" if score >= 40 else "Risk-off"
-
-    return score, label
+    label = "Risk-on" if score >= 70 else ("Neutral" if score >= 40 else "Risk-off")
+    return score, label, {"pct_idx": pct_idx, "pct_sec": pct_sec}
 
 
 # ==============================
 # EMAIL
 # ==============================
+def send_email(subject: str, body: str):
+    host = os.environ.get("SMTP_HOST")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER")
+    password = os.environ.get("SMTP_PASS")
+    mail_from = os.environ.get("MAIL_FROM", user)
+    mail_to = os.environ.get("MAIL_TO")
 
-def send_email(subject, body):
+    if not all([host, user, password, mail_to]):
+        raise RuntimeError("Faltan secrets SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_TO (y opcional MAIL_FROM).")
 
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ["SMTP_PORT"])
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASS"]
-    mail_from = os.environ["MAIL_FROM"]
-    mail_to = os.environ["MAIL_TO"]
+    recipients = [x.strip() for x in mail_to.split(",") if x.strip()]
 
     msg = MIMEMultipart()
     msg["From"] = mail_from
-    msg["To"] = mail_to
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP(host, port) as server:
-
+    with smtplib.SMTP(host, port, timeout=30) as server:
         server.starttls()
-
         server.login(user, password)
-
-        server.sendmail(mail_from, mail_to, msg.as_string())
+        server.sendmail(mail_from, recipients, msg.as_string())
 
 
 # ==============================
 # MAIN
 # ==============================
-
 def main():
-
     today = datetime.now(TZ).date().isoformat()
 
     indices_stats = {}
     sector_stats = {}
     factor_stats = {}
+    failed = []
 
-    # indices
+    # Índices (ETFs)
     for name, ticker in INDICES.items():
+        r = analyze(ticker)
+        indices_stats[name] = r
+        if r is None:
+            failed.append(ticker)
 
-        indices_stats[name] = analyze(ticker)
-
-    # sectors
+    # Sectores
     for name, ticker in SECTORS.items():
+        r = analyze(ticker)
+        sector_stats[name] = r
+        if r is None:
+            failed.append(ticker)
 
-        sector_stats[name] = analyze(ticker)
-
-    # factors
+    # Factores (para futuras mejoras; ahora los descargamos por health)
     for name, ticker in FACTORS.items():
+        r = analyze(ticker)
+        factor_stats[name] = r
+        if r is None:
+            failed.append(ticker)
 
-        factor_stats[name] = analyze(ticker)
-
-    # vix
+    # VIX proxy
     vix_data = analyze(VIX_TICKER)
-
+    if vix_data is None:
+        failed.append(VIX_TICKER)
     vix_level = vix_data["close"] if vix_data else None
 
-    score, label = market_score(indices_stats, sector_stats, vix_level)
+    score, label, meta = market_score(indices_stats, sector_stats, vix_level)
+    icon = semaforo(score)
 
-    pct_idx, pct_sec = breadth(indices_stats, sector_stats)
+    # Ranking sectores por 1W
+    sector_list = []
+    for name, stats in sector_stats.items():
+        if stats and stats.get("ret1w") is not None:
+            sector_list.append((name, stats["ret1w"]))
 
-    # ======================
-    # BUILD EMAIL
-    # ======================
+    sector_list.sort(key=lambda x: x[1])
+    bottom3 = sector_list[:3]
+    top3 = sector_list[-3:][::-1]
 
+    # Email
     lines = []
-
     lines.append(f"MARKET BRIEF — {today}")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    icon = semaforo(score)
-
-    lines.append(f"EXECUTIVE SNAPSHOT")
+    lines.append("EXECUTIVE SNAPSHOT")
     lines.append(f"Market Regime Score: {icon} {score:.0f}/100 ({label})")
-    lines.append(f"Breadth: Índices>MA200 {pct_idx:.0f}% | Sectores>MA200 {pct_sec:.0f}%")
-
-    if vix_level:
-        lines.append(f"VIX proxy: {vix_level:.1f}")
-
+    lines.append(f"Breadth: Índices>MA200 {meta['pct_idx']:.0f}% | Sectores>MA200 {meta['pct_sec']:.0f}%")
+    lines.append(f"VIX (proxy VIXY): {('n/a' if vix_level is None else f'{vix_level:.2f}')}")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
-    lines.append("MARKET STRUCTURE")
-
+    lines.append("MARKET STRUCTURE (ETFs proxy)")
     for name, stats in indices_stats.items():
-
         if not stats:
-            lines.append(f"{name}: n/a")
+            lines.append(f"- {name}: n/a")
             continue
-
         lines.append(
-            f"{name}: {fmt(stats['ret1d'])} 1D | {fmt(stats['ret1w'])} 1W | {fmt(stats['ret1m'])} 1M"
+            f"- {name}: {fmt_pct(stats['ret1d'])} 1D | {fmt_pct(stats['ret1w'])} 1W | {fmt_pct(stats['ret1m'])} 1M | "
+            f"MA200 {fmt_pct(stats['dist200'])} | MA50 {fmt_pct(stats['dist50'])}"
         )
 
     lines.append("")
     lines.append("SECTOR ROTATION (1W)")
+    if top3:
+        lines.append("- Top 3: " + ", ".join([f"{n} {fmt_pct(r)}" for n, r in top3]))
+    else:
+        lines.append("- Top 3: n/a")
+    if bottom3:
+        lines.append("- Bottom 3: " + ", ".join([f"{n} {fmt_pct(r)}" for n, r in bottom3]))
+    else:
+        lines.append("- Bottom 3: n/a")
 
-    sec_list = [s for s in sector_stats.values() if s]
-
-    sec_sorted = sorted(sec_list, key=lambda x: x["ret1w"] if x else -999)
-
-    top = sec_sorted[-3:]
-    bottom = sec_sorted[:3]
-
-    lines.append("Top sectors: " + ", ".join(fmt(x["ret1w"]) for x in top))
-    lines.append("Bottom sectors: " + ", ".join(fmt(x["ret1w"]) for x in bottom))
+    lines.append("")
+    lines.append("FACTOR FLOWS (download check)")
+    # De momento solo confirmamos si hay datos, para ir subiendo nivel luego
+    ok_factors = sum(1 for v in factor_stats.values() if v is not None)
+    lines.append(f"- Factors OK: {ok_factors}/{len(FACTORS)}")
 
     lines.append("")
     lines.append("OPERATIONAL CONCLUSION")
-
     if label == "Risk-on":
-
-        lines.append("Sesgo constructivo. Mantener exposición y buscar líderes.")
-
+        lines.append("- Sesgo constructivo. Mantener/elevar exposición y priorizar líderes.")
     elif label == "Neutral":
-
-        lines.append("Mercado mixto. Ser selectivo.")
-
+        lines.append("- Mercado mixto. Ser selectivo: setups fuertes y evitar debilidad.")
     else:
+        lines.append("- Sesgo defensivo. Priorizar protección de capital y reducir riesgo.")
 
-        lines.append("Sesgo defensivo. Priorizar protección de capital.")
+    lines.append("")
+    lines.append("DATA HEALTH")
+    ok_total = (len(INDICES) + len(SECTORS) + len(FACTORS) + 1) - len(set(failed))
+    total = (len(INDICES) + len(SECTORS) + len(FACTORS) + 1)
+    lines.append(f"- OK: {ok_total}/{total} | FAIL: {len(set(failed))}")
+    if failed:
+        lines.append("- Fail tickers: " + ", ".join(sorted(set(failed))[:20]))
 
     body = "\n".join(lines)
-
-    subject = f"Market Brief — {icon} {score:.0f}/100 ({label})"
+    subject = f"Market Brief — {today} — {icon} {score:.0f}/100 ({label})"
 
     send_email(subject, body)
 
