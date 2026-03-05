@@ -1,5 +1,6 @@
 import os
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -22,7 +23,14 @@ INDICES = {
     "Russell 2000": "^RUT",
 }
 
-# Sector ETFs (SPDR Select Sector)
+# Fallback si Yahoo no entrega índices con ^
+INDEX_FALLBACK_ETF = {
+    "^GSPC": ("SPY", "SPY (proxy S&P 500)"),
+    "^IXIC": ("QQQ", "QQQ (proxy Nasdaq)"),
+    "^DJI": ("DIA", "DIA (proxy Dow)"),
+    "^RUT": ("IWM", "IWM (proxy Russell)"),
+}
+
 SECTORS = {
     "XLK (Tech)": "XLK",
     "XLF (Financials)": "XLF",
@@ -34,10 +42,8 @@ SECTORS = {
     "XLU (Utilities)": "XLU",
     "XLB (Materials)": "XLB",
     "XLC (Comm)": "XLC",
-    # (XLRE Real Estate) opcional
 }
 
-# Factors / risk proxies
 FACTORS = {
     "SPY": "SPY",
     "QQQ": "QQQ",
@@ -49,11 +55,10 @@ FACTORS = {
 }
 
 VIX_TICKER = "^VIX"
+VIX_FALLBACK = ("VIXY", "VIXY (proxy VIX)")
 
-# Upcoming events (manual “core calendar”; tú lo afinas cuando quieras)
-# Formato: ("Nombre", "YYYY-MM-DD")
+# Upcoming events (manual; tú lo afinas cuando quieras)
 UPCOMING_EVENTS = [
-    # Ejemplos (pon aquí tus fechas reales cuando quieras)
     # ("CPI (US)", "2026-03-12"),
     # ("FOMC", "2026-03-18"),
     # ("NFP", "2026-03-06"),
@@ -85,25 +90,14 @@ def fmt_pct(x, nd=1, signed=True):
 def clamp(x, lo=0.0, hi=100.0):
     return max(lo, min(hi, x))
 
-def yfdl(ticker, period="400d"):
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
-    if df is None or df.empty or "Close" not in df:
-        return None
-    return df
-
-def compute_ma(series: pd.Series, n: int):
-    if series is None or len(series) < n:
-        return None
-    return _to_float(series.rolling(n).mean().iloc[-1])
-
-def compute_ret(series: pd.Series, n: int):
-    if series is None or len(series) < n + 1:
-        return None
-    last = _to_float(series.iloc[-1])
-    prev = _to_float(series.iloc[-(n+1)])
-    if last is None or prev in (None, 0):
-        return None
-    return (last / prev - 1.0) * 100.0
+def semaforo(score: float | None):
+    if score is None:
+        return "⚪"
+    if score >= 70:
+        return "🟢"
+    if score >= 40:
+        return "🟡"
+    return "🔴"
 
 def vix_regime(vix: float | None):
     if vix is None:
@@ -116,15 +110,57 @@ def vix_regime(vix: float | None):
         return ("Alto", "Estrés")
     return ("Extremo", "Crisis")
 
-def semaforo(score: float):
-    if score >= 70:
-        return "🟢"
-    if score >= 40:
-        return "🟡"
-    return "🔴"
+def compute_ma(series: pd.Series, n: int):
+    if series is None or len(series) < n:
+        return None
+    return _to_float(series.rolling(n).mean().iloc[-1])
 
-def safe_rank(items, key, reverse=True):
-    return sorted(items, key=lambda x: (x.get(key) is not None, x.get(key)), reverse=reverse)
+def compute_ret(series: pd.Series, n: int):
+    if series is None or len(series) < n + 1:
+        return None
+    last = _to_float(series.iloc[-1])
+    prev = _to_float(series.iloc[-(n + 1)])
+    if last is None or prev in (None, 0):
+        return None
+    return (last / prev - 1.0) * 100.0
+
+# ----------------------------
+# Robust download (key fix)
+# ----------------------------
+def _download_one(ticker: str, period="650d") -> pd.DataFrame | None:
+    """
+    1) Try yf.download single ticker (more reliable than multi in CI sometimes)
+    2) If empty, try Ticker().history()
+    3) Retry a couple times with short backoff
+    """
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                group_by="column",
+            )
+            if df is not None and not df.empty and "Close" in df.columns:
+                return df
+        except Exception as e:
+            last_err = e
+
+        # fallback method
+        try:
+            df2 = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+            if df2 is not None and not df2.empty and "Close" in df2.columns:
+                return df2
+        except Exception as e:
+            last_err = e
+
+        time.sleep(0.6 * attempt)  # gentle backoff
+
+    return None
 
 # ----------------------------
 # Data models
@@ -142,47 +178,47 @@ class InstrumentStats:
     above_ma200: bool | None
     above_ma50: bool | None
 
-def analyze_instrument(name: str, ticker: str) -> InstrumentStats | None:
-    df = yfdl(ticker, period="650d")
+def analyze_instrument(name: str, ticker: str, period="650d") -> InstrumentStats | None:
+    df = _download_one(ticker, period=period)
     if df is None:
         return None
-    c = _to_float(df["Close"].iloc[-1])
-    if c is None:
+
+    close = _to_float(df["Close"].iloc[-1])
+    if close is None or len(df) < 2:
         return None
-    prev = _to_float(df["Close"].iloc[-2]) if len(df) >= 2 else None
+
+    prev = _to_float(df["Close"].iloc[-2])
 
     ma50 = compute_ma(df["Close"], 50)
     ma200 = compute_ma(df["Close"], 200)
 
-    dist50 = pct(c, ma50)
-    dist200 = pct(c, ma200)
+    dist50 = pct(close, ma50)
+    dist200 = pct(close, ma200)
 
-    r1d = (c / prev - 1.0) * 100.0 if prev not in (None, 0) else None
+    r1d = (close / prev - 1.0) * 100.0 if prev not in (None, 0) else None
     r1w = compute_ret(df["Close"], 5)
     r1m = compute_ret(df["Close"], 21)
 
-    above200 = (ma200 is not None and c > ma200)
-    above50 = (ma50 is not None and c > ma50)
+    above200 = (ma200 is not None and close > ma200)
+    above50 = (ma50 is not None and close > ma50)
 
     return InstrumentStats(
-        name=name, ticker=ticker,
-        close=c, ret_1d=r1d, ret_1w=r1w, ret_1m=r1m,
-        dist_ma50=dist50, dist_ma200=dist200,
+        name=name,
+        ticker=ticker,
+        close=close,
+        ret_1d=r1d,
+        ret_1w=r1w,
+        ret_1m=r1m,
+        dist_ma50=dist50,
+        dist_ma200=dist200,
         above_ma200=above200 if ma200 is not None else None,
         above_ma50=above50 if ma50 is not None else None,
     )
 
 # ----------------------------
-# Breadth proxy (sin pagar)
+# Breadth proxy
 # ----------------------------
 def breadth_proxy(indices_stats: dict, sector_stats: dict):
-    """
-    No podemos calcular % de SP500 componentes > MA200 sin dataset.
-    Proxy profesional "good enough":
-    - breadth_index: % de índices principales por encima de MA200 (4 índices)
-    - breadth_sector: % de sectores por encima de MA200 (10 sectores)
-    - confirm: Russell vs Nasdaq (amplitud vs concentración)
-    """
     idx_list = [s for s in indices_stats.values() if s and s.above_ma200 is not None]
     sec_list = [s for s in sector_stats.values() if s and s.above_ma200 is not None]
 
@@ -192,15 +228,11 @@ def breadth_proxy(indices_stats: dict, sector_stats: dict):
     breadth_idx = 100.0 * idx_above / max(1, len(idx_list))
     breadth_sec = 100.0 * sec_above / max(1, len(sec_list))
 
-    # confirmation: small caps participation
     nas = indices_stats.get("Nasdaq")
     rut = indices_stats.get("Russell 2000")
     confirmation = "n/a"
     if nas and rut and nas.ret_1m is not None and rut.ret_1m is not None:
-        if rut.ret_1m >= nas.ret_1m - 0.5:
-            confirmation = "Confirmación (amplitud OK)"
-        else:
-            confirmation = "Divergencia (rally estrecho)"
+        confirmation = "Confirmación (amplitud OK)" if rut.ret_1m >= nas.ret_1m - 0.5 else "Divergencia (rally estrecho)"
 
     return breadth_idx, breadth_sec, confirmation
 
@@ -208,9 +240,6 @@ def breadth_proxy(indices_stats: dict, sector_stats: dict):
 # Factor flows
 # ----------------------------
 def ratio_strength(a: InstrumentStats | None, b: InstrumentStats | None):
-    """
-    Fuerza relativa simple: diferencia de retornos 1M como proxy.
-    """
     if not a or not b:
         return None
     if a.ret_1m is None or b.ret_1m is None:
@@ -218,53 +247,43 @@ def ratio_strength(a: InstrumentStats | None, b: InstrumentStats | None):
     return a.ret_1m - b.ret_1m
 
 # ----------------------------
-# Market Regime Score (0–100) + Overrides
+# Score + overrides
 # ----------------------------
 def compute_market_score(indices_stats: dict, sector_stats: dict, vix_level: float | None, factors_stats: dict):
-    # Components (0..100 each)
-    # 1) Indices trend breadth (25)
     idx_list = [s for s in indices_stats.values() if s and s.above_ma200 is not None]
-    pct_idx_above200 = 100.0 * sum(1 for s in idx_list if s.above_ma200) / max(1, len(idx_list))
-
-    # 2) Sector trend breadth (15)
     sec_list = [s for s in sector_stats.values() if s and s.above_ma200 is not None]
-    pct_sec_above200 = 100.0 * sum(1 for s in sec_list if s.above_ma200) / max(1, len(sec_list))
 
-    # 3) Breadth proxy (20): blend of idx+sector
+    if not idx_list or not sec_list:
+        return None, "n/a", {"penalty": 0, "pct_idx_above200": 0, "pct_sec_above200": 0, "credit_pp": None}
+
+    pct_idx_above200 = 100.0 * sum(1 for s in idx_list if s.above_ma200) / max(1, len(idx_list))
+    pct_sec_above200 = 100.0 * sum(1 for s in sec_list if s.above_ma200) / max(1, len(sec_list))
     breadth = 0.5 * pct_idx_above200 + 0.5 * pct_sec_above200
 
-    # 4) VIX regime score (15): lower VIX => higher score
     vix_score = None
     if vix_level is not None:
-        # piecewise mapping
         if vix_level < 14: vix_score = 95
         elif vix_level < 18: vix_score = 85
         elif vix_level < 25: vix_score = 65
         elif vix_level < 35: vix_score = 35
         else: vix_score = 15
 
-    # 5) Momentum 1M indices (10): average 1M return mapped
     idx_r1m = [s.ret_1m for s in idx_list if s.ret_1m is not None]
-    avg_r1m = sum(idx_r1m)/len(idx_r1m) if idx_r1m else None
+    avg_r1m = sum(idx_r1m) / len(idx_r1m) if idx_r1m else None
     mom_score = None
     if avg_r1m is not None:
-        # -6% -> 0, 0% -> 50, +6% -> 100 (clamped)
-        mom_score = clamp(50 + (avg_r1m/6.0)*50, 0, 100)
+        mom_score = clamp(50 + (avg_r1m / 6.0) * 50, 0, 100)
 
-    # 6) Small vs Large (10): IWM vs SPY 1M
     small = ratio_strength(factors_stats.get("IWM"), factors_stats.get("SPY"))
     small_score = None
     if small is not None:
-        # -4pp -> 0, 0 -> 50, +4pp -> 100
-        small_score = clamp(50 + (small/4.0)*50, 0, 100)
+        small_score = clamp(50 + (small / 4.0) * 50, 0, 100)
 
-    # 7) Credit risk (5): HYG vs LQD 1M
     credit = ratio_strength(factors_stats.get("HYG"), factors_stats.get("LQD"))
     credit_score = None
     if credit is not None:
-        credit_score = clamp(50 + (credit/3.0)*50, 0, 100)
+        credit_score = clamp(50 + (credit / 3.0) * 50, 0, 100)
 
-    # Weighted sum
     def _nv(x, default=50):
         return default if x is None else x
 
@@ -278,37 +297,24 @@ def compute_market_score(indices_stats: dict, sector_stats: dict, vix_level: flo
         0.05 * _nv(credit_score)
     )
 
-    # ---------------- Overrides (B) ----------------
-    # Hard risk-off conditions
     penalty = 0.0
-
-    # VIX stress penalty
     if vix_level is not None:
         if vix_level >= 35:
             penalty += 25
         elif vix_level >= 25:
             penalty += 12
-
-    # Breadth collapse: if sectors above 200 < 30% => penalty
     if pct_sec_above200 < 30:
         penalty += 10
-
-    # Index trend collapse: if indices above 200 <= 25% => penalty
     if pct_idx_above200 <= 25:
         penalty += 12
-
-    # Credit warning: if HYG underperforms LQD strongly
     if credit is not None and credit <= -2.0:
         penalty += 8
-
-    # Small caps warning: if IWM underperforms SPY strongly
     if small is not None and small <= -3.0:
         penalty += 6
 
     score = clamp(base - penalty, 0, 100)
-
-    # Regime label
     label = "Risk-on" if score >= 70 else ("Neutral" if score >= 40 else "Risk-off")
+
     return score, label, {
         "pct_idx_above200": pct_idx_above200,
         "pct_sec_above200": pct_sec_above200,
@@ -321,7 +327,7 @@ def compute_market_score(indices_stats: dict, sector_stats: dict, vix_level: flo
     }
 
 # ----------------------------
-# Upcoming events
+# Events
 # ----------------------------
 def upcoming_events(today: date, max_items=6):
     events = []
@@ -339,26 +345,21 @@ def upcoming_events(today: date, max_items=6):
 # ----------------------------
 # Email build
 # ----------------------------
-def build_email(subject_date: str, score: float, label: str, score_meta: dict,
+def build_email(subject_date: str, score: float | None, label: str, score_meta: dict,
                 indices_stats: dict, sector_stats: dict, factors_stats: dict,
                 breadth_idx: float, breadth_sec: float, confirmation: str,
                 vix_level: float | None, vix_change: float | None,
-                events: list[tuple]):
+                events: list[tuple],
+                data_health: dict):
     semoji = semaforo(score)
-
-    # Executive snapshot key lines
-    sp = indices_stats.get("S&P 500")
-    nas = indices_stats.get("Nasdaq")
-    rut = indices_stats.get("Russell 2000")
 
     vix_reg, vix_desc = vix_regime(vix_level)
 
-    # Sector winners/losers (1W)
+    # sector winners/losers 1W
     sectors_list = [s for s in sector_stats.values() if s and s.ret_1w is not None]
     top_sec = sorted(sectors_list, key=lambda x: x.ret_1w, reverse=True)[:3]
     bot_sec = sorted(sectors_list, key=lambda x: x.ret_1w)[:3]
 
-    # Factor summaries
     def line_factor(name, a, b):
         x = ratio_strength(factors_stats.get(a), factors_stats.get(b))
         if x is None:
@@ -366,27 +367,24 @@ def build_email(subject_date: str, score: float, label: str, score_meta: dict,
         sign = "+" if x >= 0 else ""
         return f"- {name}: {sign}{x:.1f}pp (1M)"
 
-    # Events line
-    if events:
-        ev_lines = "\n".join([f"- {name} — en {d} días ({ed.isoformat()})" for d, name, ed in events])
-    else:
-        ev_lines = "- (Configura UPCOMING_EVENTS en el script)"
+    ev_lines = "\n".join([f"- {name} — en {d} días ({ed.isoformat()})" for d, name, ed in events]) if events else "- (Configura UPCOMING_EVENTS en el script)"
 
-    # Compose email (plain text, professional)
+    # Data health
+    ok = data_health["ok"]
+    fail = data_health["fail"]
+    fail_list = data_health["fail_list"][:12]
+    rng = data_health.get("range", "n/a")
+
     body = []
     body.append(f"MARKET BRIEF — {subject_date}")
     body.append("")
     body.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     body.append("EXECUTIVE SNAPSHOT")
-    body.append(f"Market Regime Score: {semoji} {score:.0f}/100 ({label})")
-    if sp:
-        body.append(f"S&P 500: {fmt_pct(sp.ret_1d)} (1D) | {fmt_pct(sp.ret_1m)} (1M) | {fmt_pct(sp.dist_ma200)} vs MA200")
-    if nas and rut:
-        body.append(f"Nasdaq vs Russell: {confirmation}")
+    body.append(f"Market Regime Score: {semoji} {('n/a' if score is None else f'{score:.0f}/100')} ({label})")
+    body.append(f"Breadth (proxy): Índices>MA200 {breadth_idx:.0f}% | Sectores>MA200 {breadth_sec:.0f}%")
     if vix_level is not None:
         ch = f"{vix_change:+.1f}" if vix_change is not None else "n/a"
         body.append(f"VIX: {vix_level:.1f} ({vix_reg}) | Δ1D {ch} | {vix_desc}")
-    body.append(f"Breadth (proxy): Índices>{'MA200'} {breadth_idx:.0f}% | Sectores>{'MA200'} {breadth_sec:.0f}%")
     body.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     body.append("")
     body.append("MARKET STRUCTURE (Índices)")
@@ -400,59 +398,63 @@ def build_email(subject_date: str, score: float, label: str, score_meta: dict,
         )
     body.append("")
     body.append("VOLATILITY REGIME")
-    if vix_level is None:
-        body.append("- VIX: n/a")
-    else:
-        body.append(f"- VIX: {vix_level:.1f} ({vix_reg}) — {vix_desc}")
-        if score_meta.get("penalty", 0) > 0:
-            body.append(f"- Overrides/penalizaciones aplicadas: -{score_meta['penalty']:.0f} puntos (estrés/breadth/crédito)")
+    body.append(f"- VIX: {('n/a' if vix_level is None else f'{vix_level:.1f} ({vix_reg}) — {vix_desc}')}")
+
+    if score is not None and score_meta.get("penalty", 0) > 0:
+        body.append(f"- Overrides aplicados: -{score_meta['penalty']:.0f} puntos (estrés/breadth/crédito)")
+
     body.append("")
     body.append("BREADTH & INTERNALS (proxy profesional)")
-    body.append(f"- % Índices > MA200: {score_meta['pct_idx_above200']:.0f}%")
-    body.append(f"- % Sectores > MA200: {score_meta['pct_sec_above200']:.0f}%")
+    body.append(f"- % Índices > MA200: {score_meta.get('pct_idx_above200', 0):.0f}%")
+    body.append(f"- % Sectores > MA200: {score_meta.get('pct_sec_above200', 0):.0f}%")
     body.append(f"- Lectura: {confirmation}")
+
     body.append("")
     body.append("SECTOR ROTATION (1W)")
-    if top_sec:
-        body.append("- Top sectores: " + ", ".join([f"{s.name} {fmt_pct(s.ret_1w)}" for s in top_sec]))
-    else:
-        body.append("- Top sectores: n/a")
-    if bot_sec:
-        body.append("- Bottom sectores: " + ", ".join([f"{s.name} {fmt_pct(s.ret_1w)}" for s in bot_sec]))
-    else:
-        body.append("- Bottom sectores: n/a")
+    body.append("- Top sectores: " + (", ".join([f"{s.name} {fmt_pct(s.ret_1w)}" for s in top_sec]) if top_sec else "n/a"))
+    body.append("- Bottom sectores: " + (", ".join([f"{s.name} {fmt_pct(s.ret_1w)}" for s in bot_sec]) if bot_sec else "n/a"))
+
     body.append("")
     body.append("FACTOR FLOWS (1M, pp = puntos porcentuales)")
     body.append(line_factor("Small vs Large (IWM - SPY)", "IWM", "SPY"))
     body.append(line_factor("Growth bias (QQQ - SPY)", "QQQ", "SPY"))
     body.append(line_factor("Credit risk (HYG - LQD)", "HYG", "LQD"))
     body.append(line_factor("Momentum vs LowVol (MTUM - SPLV)", "MTUM", "SPLV"))
+
     body.append("")
     body.append("UPCOMING EVENTS")
     body.append(ev_lines)
+
     body.append("")
     body.append("OPERATIONAL CONCLUSION (auto)")
-    # Simple rule-based conclusion (tight, executive)
-    concl = []
-    if label == "Risk-on":
-        concl.append("- Sesgo: mantener/elevar exposición, priorizar sectores líderes.")
-    elif label == "Neutral":
-        concl.append("- Sesgo: selectivo; mantener exposición moderada, evitar añadir en debilidad.")
+    if score is None:
+        body.append("- Sin datos suficientes hoy (Yahoo no devolvió precios). Reintentar mañana o revisar Data Health.")
     else:
-        concl.append("- Sesgo: defensivo; reducir riesgo y proteger capital.")
-    # add nuance
-    if vix_level is not None and vix_level >= 25:
-        concl.append("- Nota: volatilidad elevada → reducir tamaño / esperar confirmaciones.")
-    if score_meta["pct_sec_above200"] < 40:
-        concl.append("- Nota: amplitud sectorial débil → rally frágil, exigir setups de alta calidad.")
-    if score_meta.get("credit_pp") is not None and score_meta["credit_pp"] <= -2:
-        concl.append("- Nota: crédito empeora → cuidado con high beta.")
-    body.extend(concl)
+        if label == "Risk-on":
+            body.append("- Sesgo: mantener/elevar exposición, priorizar sectores líderes.")
+        elif label == "Neutral":
+            body.append("- Sesgo: selectivo; mantener exposición moderada, evitar añadir en debilidad.")
+        else:
+            body.append("- Sesgo: defensivo; reducir riesgo y proteger capital.")
 
-    return "\n".join(body), f"Market Brief — {subject_date} — {semoji} {score:.0f}/100 ({label})"
+        if vix_level is not None and vix_level >= 25:
+            body.append("- Nota: volatilidad elevada → reducir tamaño / esperar confirmaciones.")
+        if score_meta.get("pct_sec_above200", 100) < 40:
+            body.append("- Nota: amplitud sectorial débil → rally frágil, exigir setups de alta calidad.")
+        if score_meta.get("credit_pp") is not None and score_meta["credit_pp"] <= -2:
+            body.append("- Nota: crédito empeora → cuidado con high beta.")
+
+    body.append("")
+    body.append("DATA HEALTH")
+    body.append(f"- OK: {ok} | FAIL: {fail} | Range: {rng}")
+    if fail_list:
+        body.append("- Fail tickers (max 12): " + ", ".join(fail_list))
+
+    subject = f"Market Brief — {subject_date} — {semoji} {('n/a' if score is None else f'{score:.0f}/100')} ({label})"
+    return "\n".join(body), subject
 
 # ----------------------------
-# Email send (SMTP)
+# Email send
 # ----------------------------
 def send_email_smtp(subject: str, body: str):
     smtp_host = os.environ.get("SMTP_HOST")
@@ -460,16 +462,17 @@ def send_email_smtp(subject: str, body: str):
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
     mail_from = os.environ.get("MAIL_FROM", smtp_user)
-    mail_to = os.environ.get("MAIL_TO")  # comma separated
+    mail_to = os.environ.get("MAIL_TO")
+
     if not all([smtp_host, smtp_user, smtp_pass, mail_to]):
-        raise RuntimeError("Faltan variables SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_TO (y opcional MAIL_FROM).")
+        raise RuntimeError("Faltan SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_TO (y opcional MAIL_FROM).")
 
     recipients = [x.strip() for x in mail_to.split(",") if x.strip()]
+
     msg = MIMEMultipart()
     msg["From"] = mail_from
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
-
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
@@ -483,41 +486,101 @@ def send_email_smtp(subject: str, body: str):
 def main():
     today = datetime.now(TZ).date().isoformat()
 
-    # Fetch indices
     indices_stats = {}
-    for name, t in INDICES.items():
-        indices_stats[name] = analyze_instrument(name, t)
+    sector_stats = {}
+    factors_stats = {}
 
-    # VIX
-    vix_df = yfdl(VIX_TICKER, period="90d")
+    fail_tickers = []
+    ok_count = 0
+    min_date = None
+    max_date = None
+
+    def track_range(df: pd.DataFrame | None):
+        nonlocal min_date, max_date
+        if df is None or df.empty:
+            return
+        idx = df.index
+        if len(idx) == 0:
+            return
+        d0 = idx.min().date()
+        d1 = idx.max().date()
+        min_date = d0 if min_date is None else min(min_date, d0)
+        max_date = d1 if max_date is None else max(max_date, d1)
+
+    # Indices with fallback ETFs
+    for name, t in INDICES.items():
+        st = analyze_instrument(name, t)
+        if st is None and t in INDEX_FALLBACK_ETF:
+            etf_t, etf_name = INDEX_FALLBACK_ETF[t]
+            st = analyze_instrument(name, etf_t)
+            if st is not None:
+                st = InstrumentStats(
+                    name=name, ticker=etf_t,
+                    close=st.close, ret_1d=st.ret_1d, ret_1w=st.ret_1w, ret_1m=st.ret_1m,
+                    dist_ma50=st.dist_ma50, dist_ma200=st.dist_ma200,
+                    above_ma200=st.above_ma200, above_ma50=st.above_ma50
+                )
+        indices_stats[name] = st
+        if st is None:
+            fail_tickers.append(t)
+        else:
+            ok_count += 1
+
+    # VIX with fallback
     vix_level = None
     vix_change = None
+    vix_df = _download_one(VIX_TICKER, period="120d")
+    track_range(vix_df)
+    if vix_df is None:
+        vix_df = _download_one(VIX_FALLBACK[0], period="120d")
     if vix_df is not None and len(vix_df) >= 2:
         vix_level = _to_float(vix_df["Close"].iloc[-1])
         vix_prev = _to_float(vix_df["Close"].iloc[-2])
         if vix_level is not None and vix_prev is not None:
             vix_change = vix_level - vix_prev
+        ok_count += 1
+    else:
+        fail_tickers.append(VIX_TICKER)
 
     # Sectors
-    sector_stats = {}
     for name, t in SECTORS.items():
-        sector_stats[name] = analyze_instrument(name, t)
+        st = analyze_instrument(name, t)
+        sector_stats[name] = st
+        if st is None:
+            fail_tickers.append(t)
+        else:
+            ok_count += 1
 
     # Factors
-    factors_stats = {}
     for name, t in FACTORS.items():
-        factors_stats[name] = analyze_instrument(name, t)
+        st = analyze_instrument(name, t)
+        factors_stats[name] = st
+        if st is None:
+            fail_tickers.append(t)
+        else:
+            ok_count += 1
 
     # Breadth proxy
     b_idx, b_sec, confirmation = breadth_proxy(indices_stats, sector_stats)
 
-    # Score + overrides
+    # Score
     score, label, meta = compute_market_score(indices_stats, sector_stats, vix_level, factors_stats)
 
     # Events
     ev = upcoming_events(datetime.now(TZ).date(), max_items=6)
 
-    # Build email
+    # Data health
+    total = len(INDICES) + 1 + len(SECTORS) + len(FACTORS)  # indices + vix + sectors + factors
+    fail_count = len(set(fail_tickers))
+    rng = "n/a" if (min_date is None or max_date is None) else f"{min_date.isoformat()} → {max_date.isoformat()}"
+    data_health = {
+        "ok": ok_count,
+        "fail": fail_count,
+        "fail_list": sorted(set(fail_tickers)),
+        "range": rng,
+        "total": total,
+    }
+
     body, subject = build_email(
         subject_date=today,
         score=score, label=label, score_meta=meta,
@@ -526,10 +589,10 @@ def main():
         factors_stats=factors_stats,
         breadth_idx=b_idx, breadth_sec=b_sec, confirmation=confirmation,
         vix_level=vix_level, vix_change=vix_change,
-        events=ev
+        events=ev,
+        data_health=data_health
     )
 
-    # Send
     send_email_smtp(subject, body)
 
 if __name__ == "__main__":
